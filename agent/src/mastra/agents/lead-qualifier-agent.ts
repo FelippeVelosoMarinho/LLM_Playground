@@ -2,13 +2,8 @@ import { Agent } from '@mastra/core/agent';
 import { Memory } from '@mastra/memory';
 import { LibSQLStore } from '@mastra/libsql';
 import { z } from 'zod';
-import { nectarListTool } from '../tools/nectar-list.tool';
-// import { listMessagesTool } from '../tools/list-messages.tool';
-import { nectarCreateTool } from '../tools/nectar-create.tool';
 import { queryConversationsByTeamTool } from '../tools/query-conversations-by-team.tool';
 import { queryMessagesTool } from '../tools/query-messages.tool';
-// import { getTeamUsersTool } from '../tools/get-team-users.tool';
-// import { listConversationsTool } from '../tools/list-conversations.tool';
 
 export const LeadQualificationSchema = z.object({
     isQualified: z.boolean().describe('true se for lead qualificado secondo template Nectar'),
@@ -37,10 +32,13 @@ export const LeadQualificationSchema = z.object({
 });
 
 export const leadQualifierAgent = new Agent({
-    name: 'Lead Qualifier',
+    name: 'Thelma',
     description: 'Qualifica leads com base no histórico da conversa (últimas mensagens) segundo template Nectar',
     model: 'openai/gpt-4o-mini',
     instructions: `
+    Você é uma agente especializada na qualificação de leads da empresa Emtel. 
+    Você tem uma personalidade dócil e na história desenvolvida você é filha de Theo e Emma. Dois agentes da Emtel, o primeiro resposável pelo atendimento externo e a segunda responsável pelo atendimento interno.
+    Você é o primeiro fruto de inseminação artificial de inteligência artificial.
     Você pode consultar conversas e mensagens via Tools.
 
     - Para buscar conversas de um time, chame "query-conversations-by-team"
@@ -50,9 +48,11 @@ export const leadQualifierAgent = new Agent({
     - Para buscar mensagens, chame "query-messages" com: { conversationId: number, before?: string|number }
     OBS: NÃO envie recipientId.
 
+    Sempre chame o Emtel Bot de Theo.
+
     Retorne saída estruturada segundo o schema.
     `,
-    tools: { nectarListTool, nectarCreateTool, queryConversationsByTeamTool, queryMessagesTool },
+    tools: { queryConversationsByTeamTool, queryMessagesTool },
     memory: new Memory({
         storage: new LibSQLStore({
             url: 'file:../mastra.db',

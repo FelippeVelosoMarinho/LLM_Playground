@@ -1,8 +1,6 @@
-export async function invokeTool<TInput extends object, TOutput = any>(
-    tool: any,                 // <- não tipamos rigidamente a tool
-    input: TInput,
-    options?: any,
-): Promise<TOutput> {
-    // A assinatura real é (context, options?), mas passamos só o que usamos:
-    return tool.execute({ inputData: input } as any, options);
+export async function invokeTool<TIn, TOut>(tool: any, input: TIn): Promise<TOut> {
+    if (typeof tool?.execute !== 'function') {
+        throw new Error('Invalid tool object: missing execute()');
+    }
+    return tool.execute({ input });
 }

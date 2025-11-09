@@ -24,6 +24,16 @@ export type MiddlewareHandler = (c: any, next: () => Promise<void>) => Promise<v
 
 const COMMERCIAL_TEAM_IDS = new Set<number>([10, 15, 14, 12]);
 
+const TRACE = process.env.LEADQ_TRACE === "1";
+const DEBUG = process.env.LEADQ_DEBUG === "1";
+
+function logTrace(...args: any[]) {
+  if (TRACE) console.log("[LeadQ:TRACE]", ...args);
+}
+function logDebug(...args: any[]) {
+  if (DEBUG) console.log("[LeadQ:DEBUG]", ...args);
+}
+
 function isHumanMessage(m: AnyDict): boolean {
   const st = m?.sender_type;
   return st === "Contact" || st === "Agent" || (!st && [0, 1].includes(m?.message_type));
@@ -79,17 +89,83 @@ function isDesqualified(conv: AnyDict): boolean {
   return false;
 }
 
-function bucketOf(conv: AnyDict): Bucket {
-  if (isDesqualified(conv)) return "DESQUALIFICADO";
-  if (conv?.status === "resolved") return "COMPLETO";
+type Decision = {
+  bucket: Bucket;
+  reasons: string[];
+  flags: {
+    hasHumanMsg: boolean;
+    isResolved: boolean;
+    isDesqualified: boolean;
+    hasAnalysis: boolean;
+    analysisSource: "agent_bot" | "llm_cache" | "none";
+  };
+};
 
+function bucketDecision(conv: AnyDict): Decision {
+  const reasons: string[] = [];
+  const analysis = analysisFrom(conv);
   const firstReply = conv?.first_reply_created_at ?? 0;
-  if (!firstReply) {
-    const msgs: AnyDict[] = conv?.messages ?? [];
-    const hasHuman = msgs.some(isHumanMessage);
-    if (!hasHuman) return "SEM_CONTATO";
+
+  const hasHuman = (conv?.messages ?? []).some(isHumanMessage);
+  const isResolved = conv?.status === "resolved";
+  const desq = isDesqualified(conv);
+
+  if (desq) reasons.push("match: desqualificado (label/custom_attributes/mensagem bot)");
+  if (isResolved) reasons.push("status=resolved");
+  if (!firstReply) reasons.push("first_reply_created_at ausente");
+  if (hasHuman) reasons.push("há mensagens humanas na thread");
+  if (analysis.analysis) reasons.push(`analysis presente (source=${analysis.source})`);
+
+  let bucket: Bucket;
+  if (desq) bucket = "DESQUALIFICADO";
+  else if (isResolved) bucket = "COMPLETO";
+  else if (!firstReply && !hasHuman) bucket = "SEM_CONTATO";
+  else bucket = "CONTATO_FEITO";
+
+  return {
+    bucket,
+    reasons,
+    flags: {
+      hasHumanMsg: hasHuman,
+      isResolved,
+      isDesqualified: desq,
+      hasAnalysis: !!analysis.analysis,
+      analysisSource: analysis.source,
+    },
+  };
+}
+
+// function bucketOf(conv: AnyDict): Bucket {
+//   if (isDesqualified(conv)) return "DESQUALIFICADO";
+//   if (conv?.status === "resolved") return "COMPLETO";
+
+//   const firstReply = conv?.first_reply_created_at ?? 0;
+//   if (!firstReply) {
+//     const msgs: AnyDict[] = conv?.messages ?? [];
+//     const hasHuman = msgs.some(isHumanMessage);
+//     if (!hasHuman) return "SEM_CONTATO";
+//   }
+//   return "CONTATO_FEITO";
+// }
+
+const perTeamStats: Record<number, {
+  total: number;
+  buckets: Record<Bucket, number>;
+  analysis: { any: number; bySource: Record<"agent_bot" | "llm_cache" | "none", number>; };
+  desqualified: number;
+  resolved: number;
+}> = {};
+
+function initTeamStats(teamId: number) {
+  if (!perTeamStats[teamId]) {
+    perTeamStats[teamId] = {
+      total: 0,
+      buckets: { SEM_CONTATO: 0, CONTATO_FEITO: 0, DESQUALIFICADO: 0, COMPLETO: 0 },
+      analysis: { any: 0, bySource: { agent_bot: 0, llm_cache: 0, none: 0 } },
+      desqualified: 0,
+      resolved: 0,
+    };
   }
-  return "CONTATO_FEITO";
 }
 
 const safeJson = (txt: string) => { try { return JSON.parse(txt); } catch { return { raw: txt }; } };
@@ -177,6 +253,7 @@ export const mastra = new Mastra({
         handler: async (c) => {
           try {
             // valida query
+            const noFilters = new URL(c.req.url).searchParams.get("no_filters") === "1";
             const parsed = LeadQuery.safeParse(Object.fromEntries(new URL(c.req.url).searchParams));
             if (!parsed.success) {
               c.status(422 as any);
@@ -214,8 +291,12 @@ export const mastra = new Mastra({
             // fan-out
             const baseQs = new URLSearchParams();
             baseQs.set("account_id", String(account_id));
-            baseQs.set("status", status);
-            baseQs.set("assignee_type", assignee_type);
+            if (status !== "all") {                
+              baseQs.set("status", status);
+            }
+            if (!noFilters) {
+              baseQs.set("assignee_type", assignee_type);
+            }
             if (before !== undefined) baseQs.set("before", String(before));
 
             const requests = teamIds.map(async (tid) => {
@@ -231,11 +312,22 @@ export const mastra = new Mastra({
                   "Accept": "application/json",
                 },
               });
-              const text = await res.text();
-              if (!res.ok) {
-                return { ok: false, status: res.status, body: safeJson(text), team_id: tid };
+              console.log("[LeadQ:DEBUG] teamIds efetivos:", teamIds);
+              const rawText = await res.text();
+              if (process.env.LEADQ_DEBUG === "1") {
+                console.log("[LeadQ:DEBUG:upstream]", {
+                  team_id: tid,
+                  url: u.toString(),
+                  status: res.status,
+                  // Mostra só os primeiros 1200 chars para não poluir
+                  body_head: rawText.slice(0, 1200),
+                });
               }
-              return { ok: true, data: safeJson(text), team_id: tid };
+              if (!res.ok) {
+                return { ok: false, status: res.status, body: safeJson(rawText), team_id: tid };
+              }
+              const parsed = safeJson(rawText);
+              return { ok: true, data: safeJson(rawText), team_id: tid };
             });
 
             const results = await Promise.all(requests);
@@ -257,29 +349,62 @@ export const mastra = new Mastra({
                 if (DEBUG) debugInfo.push({ team_id: r.team_id, ok: false, status: r.status, body: r.body });
                 continue;
               }
+
               const raw = r.data;
               let items: AnyDict[] = [];
-              //const items: AnyDict[] = r.data?.data?.payload ?? [];
-
               if (raw?.data?.payload && Array.isArray(raw.data.payload)) items = raw.data.payload;
               else if (raw?.payload && Array.isArray(raw.payload)) items = raw.payload;
               else if (raw?.results && Array.isArray(raw.results)) items = raw.results;
               else if (raw?.data?.items && Array.isArray(raw.data.items)) items = raw.data.items;
+
+              initTeamStats(r.team_id);
+              const stats = perTeamStats[r.team_id];
+
+              logDebug("time", r.team_id, "itens", items.length);
+
+              for (const conv of items) {
+                const decision = bucketDecision(conv);
+                const card = buildCard(conv);
+                card.team_id = card.team_id ?? r.team_id ?? null;
+
+                // métricas
+                stats.total += 1;
+                stats.buckets[decision.bucket] += 1;
+                if (decision.flags.hasAnalysis) {
+                  stats.analysis.any += 1;
+                  stats.analysis.bySource[decision.flags.analysisSource] += 1;
+                }
+                if (decision.flags.isDesqualified) stats.desqualified += 1;
+                if (decision.flags.isResolved) stats.resolved += 1;
+
+                // trace por conversa (opcional, só quando LEADQ_TRACE=1)
+                logTrace("conv", card.conversation_id, "uuid", card.uuid, "=>", decision.bucket, "|", decision.reasons.join(" ; "));
+
+                buckets[decision.bucket].push(card);
+              }
+
+              // resumo do time
+              logDebug("resumo time", r.team_id, {
+                total: stats.total,
+                buckets: stats.buckets,
+                analysis_any: stats.analysis.any,
+                analysis_bySource: stats.analysis.bySource,
+                desqualified: stats.desqualified,
+                resolved: stats.resolved,
+              });
 
               if (DEBUG) {
                 debugInfo.push({
                   team_id: r.team_id,
                   ok: true,
                   count: items.length,
+                  buckets: stats.buckets,
+                  analysis_any: stats.analysis.any,
+                  analysis_bySource: stats.analysis.bySource,
+                  desqualified: stats.desqualified,
+                  resolved: stats.resolved,
                   sample: items[0] ? Object.keys(items[0]).slice(0, 10) : [],
                 });
-              }
-
-              for (const conv of items) {
-                const b = bucketOf(conv);
-                const card = buildCard(conv);
-                card.team_id = card.team_id ?? r.team_id ?? null;
-                buckets[b].push(card);
               }
             }
 

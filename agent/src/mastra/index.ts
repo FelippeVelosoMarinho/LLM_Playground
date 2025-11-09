@@ -7,25 +7,25 @@ import { weatherWorkflow } from './workflows/weather-workflow';
 import { weatherAgent } from './agents/weather-agent';
 import { leadQualifierAgent } from './agents/lead-qualifier-agent';
 import { crmPipelineWorkflow } from './workflows/crm-pipeline-workflow';
-
 import { z } from "zod";
 
 const LeadQuery = z.object({
   account_id: z.coerce.number(),
-  team_id: z.coerce.number(),
+  team_ids: z.string().optional(),
+  team_id: z.coerce.number().optional(),
   status: z.string().default("all"),
   assignee_type: z.string().default("all"),
   before: z.coerce.number().optional(),
 });
 
-// --- Helpers de classificação/normalização -------------------------------
-
 type AnyDict = Record<string, any>;
 type Bucket = "SEM_CONTATO" | "CONTATO_FEITO" | "DESQUALIFICADO" | "COMPLETO";
+export type MiddlewareHandler = (c: any, next: () => Promise<void>) => Promise<void | Response>;
+
+const COMMERCIAL_TEAM_IDS = new Set<number>([10, 15, 14, 12]);
 
 function isHumanMessage(m: AnyDict): boolean {
   const st = m?.sender_type;
-  // message_type 0/1 normalmente são texto do contato/atendente
   return st === "Contact" || st === "Agent" || (!st && [0, 1].includes(m?.message_type));
 }
 
@@ -92,6 +92,8 @@ function bucketOf(conv: AnyDict): Bucket {
   return "CONTATO_FEITO";
 }
 
+const safeJson = (txt: string) => { try { return JSON.parse(txt); } catch { return { raw: txt }; } };
+
 function buildCard(conv: AnyDict) {
   const meta = conv?.meta ?? {};
   const sender = meta?.sender ?? {};
@@ -112,6 +114,7 @@ function buildCard(conv: AnyDict) {
     contact_phone: phone,
     assignee_name: assignee?.available_name ?? assignee?.name ?? null,
     team_id: meta?.team?.id ?? null,
+    team_name: meta?.team?.name ?? null,
     status: conv?.status ?? "unknown",
     unread_count: conv?.unread_count ?? 0,
     last_activity_at: conv?.last_activity_at ?? 0,
@@ -121,30 +124,41 @@ function buildCard(conv: AnyDict) {
   };
 }
 
+const withCors: MiddlewareHandler = async (c, next) => {
+  const origin = c.req.header('Origin') ?? '*';
+
+  if (c.req.method === 'OPTIONS') {
+    // pré-flight
+    return c.body(null, 204, {
+      'Access-Control-Allow-Origin': origin,
+      'Vary': 'Origin',
+      'Access-Control-Allow-Credentials': 'true',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, api_access_token, Accept, X-Requested-With',
+      'Access-Control-Max-Age': '86400',
+    });
+  }
+
+  // resposta normal
+  c.header('Access-Control-Allow-Origin', origin);
+  c.header('Vary', 'Origin');
+  c.header('Access-Control-Allow-Credentials', 'true');
+  await next();
+};
+
 export const mastra = new Mastra({
   workflows: { weatherWorkflow, crmPipelineWorkflow },
   agents: { weatherAgent, leadQualifierAgent },
-  storage: new LibSQLStore({
-    // stores observability, scores, ... into memory storage, if it needs to persist, change to file:../mastra.db
-    url: ":memory:",
-  }),
-  logger: new PinoLogger({
-    name: 'Mastra',
-    level: 'info',
-  }),
-  telemetry: {
-    // Telemetry is deprecated and will be removed in the Nov 4th release
-    enabled: false,
-  },
-  observability: {
-    // Enables DefaultExporter and CloudExporter for AI tracing
-    default: { enabled: true },
-  },
+  storage: new LibSQLStore({ url: ":memory:" }),
+  logger: new PinoLogger({ name: 'Mastra', level: 'info' }),
+  telemetry: { enabled: false },
+  observability: { default: { enabled: true } },
   server: {
     apiRoutes: [
       registerApiRoute("/lead-qualification", {
         method: "GET",
         middleware: [
+          withCors,
           async (c, next) => {
             console.log(`[LeadQ] ${c.req.method} ${c.req.url}`);
             await next();
@@ -152,13 +166,12 @@ export const mastra = new Mastra({
           async (c, next) => {
             const token = c.req.header("api_access_token");
             if (!token) {
-              const detail = [
-                { loc: ["header", "api_access_token"], msg: "field required", type: "value_error.missing" },
-              ];
-              c.status(422);
-              return c.json({ detail });
+              c.status(422 as any);
+              return c.json({
+                detail: [{ loc: ["header", "api_access_token"], msg: "field required", type: "value_error.missing" }],
+              });
             }
-            await next(); // não usa c.set/get — apenas valida
+            await next();
           },
         ],
         handler: async (c) => {
@@ -166,71 +179,129 @@ export const mastra = new Mastra({
             // valida query
             const parsed = LeadQuery.safeParse(Object.fromEntries(new URL(c.req.url).searchParams));
             if (!parsed.success) {
-              c.status(422);
+              c.status(422 as any);
               return c.json({ detail: parsed.error.issues });
             }
-            const { account_id, team_id, status, assignee_type, before } = parsed.data;
+            const { account_id, status, assignee_type, before } = parsed.data;
+
+            // normaliza teamIds + trava Comercial
+            let teamIds: number[] = [];
+            if (parsed.data.team_ids) {
+              teamIds = parsed.data.team_ids
+                .split(",")
+                .map(s => Number(s.trim()))
+                .filter(n => Number.isFinite(n));
+            } else if (parsed.data.team_id != null) {
+              teamIds = [parsed.data.team_id];
+            } else {
+              teamIds = Array.from(COMMERCIAL_TEAM_IDS);
+            }
+            teamIds = teamIds.filter(id => COMMERCIAL_TEAM_IDS.has(id));
+            if (!teamIds.length) {
+              c.status(422 as any);
+              return c.json({
+                detail: [{ loc: ["query", "team_ids"], msg: "Nenhum team_id válido de Comercial (10,12,14,15).", type: "value_error" }],
+              });
+            }
 
             const BASE_URL = process.env.BASE_URL;
             if (!BASE_URL) {
-              c.status(500);
+              c.status(500 as any);
               return c.json({ error: "config_error", message: "BASE_URL não definido no servidor Mastra" });
             }
+            const token = c.req.header("api_access_token")!;
 
-            const token = c.req.header("api_access_token")!; // já validado no middleware
+            // fan-out
+            const baseQs = new URLSearchParams();
+            baseQs.set("account_id", String(account_id));
+            baseQs.set("status", status);
+            baseQs.set("assignee_type", assignee_type);
+            if (before !== undefined) baseQs.set("before", String(before));
 
-            // monta URL upstream
-            const u = new URL(`${BASE_URL}/backend/v1/conversations`);
-            u.searchParams.set("account_id", String(account_id));
-            u.searchParams.set("team_id", String(team_id));
-            u.searchParams.set("status", status);
-            u.searchParams.set("assignee_type", assignee_type);
-            if (before !== undefined) u.searchParams.set("before", String(before));
+            const requests = teamIds.map(async (tid) => {
+              const u = new URL(`${BASE_URL}/backend/v1/conversations`);
+              const qs = new URLSearchParams(baseQs.toString());
+              qs.set("team_id", String(tid));
+              u.search = qs.toString();
 
-            const res = await fetch(u, {
-              headers: {
-                "Content-Type": "application/json",
-                // seu backend exige este header:
-                "api_access_token": token,
-              },
+              const res = await fetch(u, {
+                headers: {
+                  "Content-Type": "application/json",
+                  "api_access_token": token,
+                  "Accept": "application/json",
+                },
+              });
+              const text = await res.text();
+              if (!res.ok) {
+                return { ok: false, status: res.status, body: safeJson(text), team_id: tid };
+              }
+              return { ok: true, data: safeJson(text), team_id: tid };
             });
 
-            const text = await res.text();
-            if (!res.ok) {
-              console.error("[LeadQ] conversations error:", res.status, text);
-              c.status(res.status as any);
-              return c.json({ error: "upstream_error", status: res.status, body: safeJson(text) });
-            }
+            const results = await Promise.all(requests);
 
-            const conversationsPayload = safeJson(text);
-            const items: any[] = conversationsPayload?.data?.payload ?? [];
-            const meta: any = conversationsPayload?.data?.meta ?? {};
+            const DEBUG = process.env.LEADQ_DEBUG === "1";
 
-            const buckets: Record<"SEM_CONTATO" | "CONTATO_FEITO" | "DESQUALIFICADO" | "COMPLETO", any[]> = {
+            const debugInfo: any[] = [];
+
+            const buckets: Record<Bucket, any[]> = {
               SEM_CONTATO: [],
               CONTATO_FEITO: [],
               DESQUALIFICADO: [],
               COMPLETO: [],
             };
 
-            for (const conv of items) {
-              const b = bucketOf(conv);
-              buckets[b].push(buildCard(conv));
+            for (const r of results) {
+              if (!r.ok) {
+                console.error("[LeadQ] upstream_error team", r.team_id, r.status, r.body);
+                if (DEBUG) debugInfo.push({ team_id: r.team_id, ok: false, status: r.status, body: r.body });
+                continue;
+              }
+              const raw = r.data;
+              let items: AnyDict[] = [];
+              //const items: AnyDict[] = r.data?.data?.payload ?? [];
+
+              if (raw?.data?.payload && Array.isArray(raw.data.payload)) items = raw.data.payload;
+              else if (raw?.payload && Array.isArray(raw.payload)) items = raw.payload;
+              else if (raw?.results && Array.isArray(raw.results)) items = raw.results;
+              else if (raw?.data?.items && Array.isArray(raw.data.items)) items = raw.data.items;
+
+              if (DEBUG) {
+                debugInfo.push({
+                  team_id: r.team_id,
+                  ok: true,
+                  count: items.length,
+                  sample: items[0] ? Object.keys(items[0]).slice(0, 10) : [],
+                });
+              }
+
+              for (const conv of items) {
+                const b = bucketOf(conv);
+                const card = buildCard(conv);
+                card.team_id = card.team_id ?? r.team_id ?? null;
+                buckets[b].push(card);
+              }
             }
-            (Object.keys(buckets) as (keyof typeof buckets)[]).forEach((k) =>
+
+            // ordena por recência
+            (Object.keys(buckets) as Bucket[]).forEach((k) =>
               buckets[k].sort((a, b) => (b.last_activity_at ?? 0) - (a.last_activity_at ?? 0))
             );
 
-            return c.json({
-              meta,
-              groups: (Object.keys(buckets) as (keyof typeof buckets)[]).map((k) => ({
+            const responseBody: any = {
+              meta: { account_id, team_ids: teamIds },
+              groups: (Object.keys(buckets) as Bucket[]).map((k) => ({
                 bucket: k,
                 items: buckets[k],
               })),
-            });
+            };
+
+            if (DEBUG) responseBody.debug = debugInfo;
+
+            return c.json(responseBody);
           } catch (err: any) {
             console.error("[LeadQ] handler error:", err);
-            c.status(500);
+            c.status(500 as any);
             return c.json({ error: "internal_error", message: err?.message ?? String(err) });
           }
         },
@@ -238,11 +309,3 @@ export const mastra = new Mastra({
     ],
   },
 });
-
-function safeJson(txt: string) {
-  try {
-    return JSON.parse(txt);
-  } catch {
-    return { raw: txt };
-  }
-}

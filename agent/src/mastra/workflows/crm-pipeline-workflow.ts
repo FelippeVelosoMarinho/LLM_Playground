@@ -1,8 +1,6 @@
 import { createWorkflow, createStep } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { ENV } from '../../../../env';
-
-import { nectarCreateTool } from '../tools/nectar-create.tool';
 import { leadQualifierAgent } from '../agents/lead-qualifier-agent';
 
 // NOVAS TOOLS (as únicas para consultas):
@@ -175,18 +173,18 @@ const qualifyAndCreate = createStep({
 
                     if (parsed.success && parsed.data.isQualified && parsed.data.oportunidade) {
                         const opp = parsed.data.oportunidade;
-                        await nectarCreateTool.execute({
-                            input: {
-                                nome: opp.nome,
-                                probabilidade: opp.probabilidade,
-                                valorAvulso: opp.valorAvulso,
-                                valorMensal: opp.valorMensal,
-                                observacao: opp.observacao,
-                                clienteId: opp.cliente?.id,
-                                clienteNome: opp.cliente?.nome,
-                                produtos: opp.produtos,
-                            },
-                        });
+                        // await nectarCreateTool.execute({
+                        //     input: {
+                        //         nome: opp.nome,
+                        //         probabilidade: opp.probabilidade,
+                        //         valorAvulso: opp.valorAvulso,
+                        //         valorMensal: opp.valorMensal,
+                        //         observacao: opp.observacao,
+                        //         clienteId: opp.cliente?.id,
+                        //         clienteNome: opp.cliente?.nome,
+                        //         produtos: opp.produtos,
+                        //     },
+                        // });
                         createdOpps += 1;
                     }
                 } catch (e: any) {

@@ -20,6 +20,9 @@ const LeadQuery = z.object({
 
 type AnyDict = Record<string, any>;
 type Bucket = "SEM_CONTATO" | "CONTATO_FEITO" | "DESQUALIFICADO" | "COMPLETO";
+type LeadCardWithBucket = ReturnType<typeof buildCard> & {
+  bucket: Bucket;
+};
 export type MiddlewareHandler = (c: any, next: () => Promise<void>) => Promise<void | Response>;
 
 const COMMERCIAL_TEAM_IDS = new Set<number>([10, 15, 14, 12]);
@@ -122,6 +125,8 @@ function bucketDecision(conv: AnyDict): Decision {
   else if (!firstReply && !hasHuman) bucket = "SEM_CONTATO";
   else bucket = "CONTATO_FEITO";
 
+  console.log("bucket: ", bucket, "| reasons:", reasons.join(" ; "));
+
   return {
     bucket,
     reasons,
@@ -157,6 +162,7 @@ const perTeamStats: Record<number, {
 }> = {};
 
 function initTeamStats(teamId: number) {
+  console.log();
   if (!perTeamStats[teamId]) {
     perTeamStats[teamId] = {
       total: 0,
@@ -291,7 +297,7 @@ export const mastra = new Mastra({
             // fan-out
             const baseQs = new URLSearchParams();
             baseQs.set("account_id", String(account_id));
-            if (status !== "all") {                
+            if (status !== "all") {
               baseQs.set("status", status);
             }
             if (!noFilters) {
@@ -300,10 +306,12 @@ export const mastra = new Mastra({
             if (before !== undefined) baseQs.set("before", String(before));
 
             const requests = teamIds.map(async (tid) => {
-              const u = new URL(`${BASE_URL}/backend/v1/conversations`);
+              const u = new URL(`${BASE_URL}/backend/v1/conversations/`);
               const qs = new URLSearchParams(baseQs.toString());
               qs.set("team_id", String(tid));
               u.search = qs.toString();
+
+              console.log(`[LeadQ:DEBUG:request] team_id: ${tid}, url: ${u.toString()}`);
 
               const res = await fetch(u, {
                 headers: {
@@ -312,6 +320,7 @@ export const mastra = new Mastra({
                   "Accept": "application/json",
                 },
               });
+              console.log("resposta da request: ", res);
               console.log("[LeadQ:DEBUG] teamIds efetivos:", teamIds);
               const rawText = await res.text();
               if (process.env.LEADQ_DEBUG === "1") {
@@ -324,24 +333,27 @@ export const mastra = new Mastra({
                 });
               }
               if (!res.ok) {
+                console.error("[LeadQ:DEBUG:upstream_error_body] team_id", tid, "body:", rawText);
                 return { ok: false, status: res.status, body: safeJson(rawText), team_id: tid };
               }
               const parsed = safeJson(rawText);
-              return { ok: true, data: safeJson(rawText), team_id: tid };
+              return { ok: true, data: parsed, team_id: tid };
             });
 
             const results = await Promise.all(requests);
 
             const DEBUG = process.env.LEADQ_DEBUG === "1";
 
+            const allClassifiedLeads: LeadCardWithBucket[] = [];
+
             const debugInfo: any[] = [];
 
-            const buckets: Record<Bucket, any[]> = {
-              SEM_CONTATO: [],
-              CONTATO_FEITO: [],
-              DESQUALIFICADO: [],
-              COMPLETO: [],
-            };
+            // const buckets: Record<Bucket, any[]> = {
+            //   SEM_CONTATO: [],
+            //   CONTATO_FEITO: [],
+            //   DESQUALIFICADO: [],
+            //   COMPLETO: [],
+            // };
 
             for (const r of results) {
               if (!r.ok) {
@@ -352,10 +364,43 @@ export const mastra = new Mastra({
 
               const raw = r.data;
               let items: AnyDict[] = [];
-              if (raw?.data?.payload && Array.isArray(raw.data.payload)) items = raw.data.payload;
-              else if (raw?.payload && Array.isArray(raw.payload)) items = raw.payload;
-              else if (raw?.results && Array.isArray(raw.results)) items = raw.results;
-              else if (raw?.data?.items && Array.isArray(raw.data.items)) items = raw.data.items;
+              let dataPath: string = "unknown_path"; // Variável para rastrear o caminho
+
+              if (raw?.data?.payload && Array.isArray(raw.data.payload)) {
+                items = raw.data.payload;
+                dataPath = "raw.data.payload";
+              }
+              else if (raw?.payload && Array.isArray(raw.payload)) {
+                items = raw.payload;
+                dataPath = "raw.payload";
+              }
+              else if (raw?.results && Array.isArray(raw.results)) {
+                items = raw.results;
+                dataPath = "raw.results";
+              }
+              else if (raw?.data?.items && Array.isArray(raw.data.items)) {
+                items = raw.data.items;
+                dataPath = "raw.data.items";
+              } else if (raw?.items && Array.isArray(raw.items)) {
+                items = raw.items;
+                dataPath = "raw.items";
+              } else if (raw?.data?.results && Array.isArray(raw.data.results)) {
+                items = raw.data.results;
+                dataPath = "raw.data.results";
+              }
+
+              console.log(`[LeadQ:DEBUG:extraction] team_id: ${r.team_id}, items_extracted: ${items.length}, path: ${dataPath}`);
+
+              // [NOVO LOG CHAVE] Se items_extracted for 0, logamos o RAW data (parcial)
+              if (items.length === 0 && DEBUG) {
+                // Loga as chaves de alto nível e as chaves de 'data', para identificação
+                console.log(`[LeadQ:DEBUG:RAW_KEYS] team_id: ${r.team_id}, raw_keys: ${Object.keys(raw ?? {})}, data_keys: ${Object.keys(raw?.data ?? {})}`);
+              }
+              console.log(`[LeadQ:DEBUG:extraction] team_id: ${r.team_id}, items_extracted: ${items.length}, total_items_extracted_so_far: ${allClassifiedLeads.length + items.length}`);
+              console.log(`[LeadQ: DATA:extraction] ${raw.data.payload} ? "data.payload" :${raw.payload} ? "payload" : ${raw.results} ? "results" : raw.data?.items ? "data.items" : "unknown_path"`);
+              if (DEBUG) {
+                console.log("Response sample keys:", r.ok ? Object.keys(r.data ?? {}) : Object.keys(r.body ?? {}));
+              }
 
               initTeamStats(r.team_id);
               const stats = perTeamStats[r.team_id];
@@ -380,7 +425,11 @@ export const mastra = new Mastra({
                 // trace por conversa (opcional, só quando LEADQ_TRACE=1)
                 logTrace("conv", card.conversation_id, "uuid", card.uuid, "=>", decision.bucket, "|", decision.reasons.join(" ; "));
 
-                buckets[decision.bucket].push(card);
+                //buckets[decision.bucket].push(card);
+                allClassifiedLeads.push({
+                  ...card,
+                  bucket: decision.bucket,
+                });
               }
 
               // resumo do time
@@ -409,16 +458,14 @@ export const mastra = new Mastra({
             }
 
             // ordena por recência
-            (Object.keys(buckets) as Bucket[]).forEach((k) =>
-              buckets[k].sort((a, b) => (b.last_activity_at ?? 0) - (a.last_activity_at ?? 0))
-            );
+            // (Object.keys(buckets) as Bucket[]).forEach((k) =>
+            //   buckets[k].sort((a, b) => (b.last_activity_at ?? 0) - (a.last_activity_at ?? 0))
+            // );
+            allClassifiedLeads.sort((a, b) => (b.last_activity_at ?? 0) - (a.last_activity_at ?? 0));
 
             const responseBody: any = {
               meta: { account_id, team_ids: teamIds },
-              groups: (Object.keys(buckets) as Bucket[]).map((k) => ({
-                bucket: k,
-                items: buckets[k],
-              })),
+              items: allClassifiedLeads,
             };
 
             if (DEBUG) responseBody.debug = debugInfo;

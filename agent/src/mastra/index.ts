@@ -297,13 +297,14 @@ export const mastra = new Mastra({
             // fan-out
             const baseQs = new URLSearchParams();
             baseQs.set("account_id", String(account_id));
-            if (status !== "all") {
-              baseQs.set("status", status);
-            }
+            // if (status !== "all") {
+            //   baseQs.set("status", status);
+            // }
             if (!noFilters) {
               baseQs.set("assignee_type", assignee_type);
             }
             if (before !== undefined) baseQs.set("before", String(before));
+            baseQs.set("status", "all");
 
             const requests = teamIds.map(async (tid) => {
               const u = new URL(`${BASE_URL}/backend/v1/conversations/`);
